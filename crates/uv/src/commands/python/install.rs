@@ -72,8 +72,7 @@ struct Changelog {
     existing: FxHashSet<PythonInstallationKey>,
     installed: FxHashSet<PythonInstallationKey>,
     uninstalled: FxHashSet<PythonInstallationKey>,
-    installed_executables: FxHashMap<PythonInstallationKey, Vec<PathBuf>>,
-    uninstalled_executables: FxHashSet<PathBuf>,
+    installed_executables: FxHashMap<PythonInstallationKey, FxHashSet<PathBuf>>,
 }
 
 impl Changelog {
@@ -104,10 +103,12 @@ impl Changelog {
 }
 
 /// Download and install Python versions.
+#[allow(clippy::fn_params_excessive_bools)]
 pub(crate) async fn install(
     project_dir: &Path,
     targets: Vec<String>,
     reinstall: bool,
+    default: bool,
     python_downloads: PythonDownloads,
     native_tls: bool,
     connectivity: Connectivity,
@@ -116,6 +117,11 @@ pub(crate) async fn install(
     printer: Printer,
 ) -> Result<ExitStatus> {
     let start = std::time::Instant::now();
+
+    if default && !preview.is_enabled() {
+        writeln!(printer.stderr(), "The `--default` flag is only available in preview mode; add the `--preview` flag to use `--default.")?;
+        return Ok(ExitStatus::Failure);
+    }
 
     // Resolve the requests
     let mut is_default_install = false;
@@ -137,6 +143,10 @@ pub(crate) async fn install(
             .map(|target| PythonRequest::parse(target.as_str()))
             .map(InstallRequest::new)
             .collect::<Result<Vec<_>>>()?
+    };
+
+    let Some(first_request) = requests.first() else {
+        return Ok(ExitStatus::Success);
     };
 
     // Read the existing installations, lock the directory for the duration
@@ -275,54 +285,67 @@ pub(crate) async fn install(
             .expect("We should have a bin directory with preview enabled")
             .as_path();
 
-        let target = bin.join(installation.key().versioned_executable_name());
+        let targets = if (default || is_default_install)
+            && first_request.matches_installation(installation)
+        {
+            vec![
+                installation.key().executable_name_minor(),
+                installation.key().executable_name_major(),
+                installation.key().executable_name(),
+            ]
+        } else {
+            vec![installation.key().executable_name_minor()]
+        };
 
-        match installation.create_bin_link(&target) {
-            Ok(()) => {
-                debug!(
-                    "Installed executable at {} for {}",
-                    target.user_display(),
-                    installation.key(),
-                );
-                changelog.installed.insert(installation.key().clone());
-                changelog
-                    .installed_executables
-                    .entry(installation.key().clone())
-                    .or_default()
-                    .push(target.clone());
-            }
-            Err(uv_python::managed::Error::LinkExecutable { from, to, err })
-                if err.kind() == ErrorKind::AlreadyExists =>
-            {
-                // TODO(zanieb): Add `--force`
-                if reinstall {
-                    fs_err::remove_file(&to)?;
-                    installation.create_bin_link(&target)?;
+        for target in targets {
+            let target = bin.join(target);
+            changelog
+                .installed_executables
+                .entry(installation.key().clone())
+                .or_default()
+                .insert(target.clone());
+            match installation.create_bin_link(&target) {
+                Ok(()) => {
                     debug!(
-                        "Updated executable at {} to {}",
+                        "Installed executable at {} for {}",
                         target.user_display(),
                         installation.key(),
                     );
                     changelog.installed.insert(installation.key().clone());
-                    changelog
-                        .installed_executables
-                        .entry(installation.key().clone())
-                        .or_default()
-                        .push(target.clone());
-                    changelog.uninstalled_executables.insert(target);
-                } else {
-                    if !is_same_file(&to, &from).unwrap_or_default() {
-                        errors.push((
+                }
+                Err(uv_python::managed::Error::LinkExecutable { from, to, err })
+                    if err.kind() == ErrorKind::AlreadyExists =>
+                {
+                    // TODO(zanieb): Add `--force`
+                    if reinstall {
+                        fs_err::remove_file(&to)?;
+                        installation.create_bin_link(&target)?;
+                        debug!(
+                            "Updated executable at {} to {}",
+                            target.user_display(),
                             installation.key(),
-                            anyhow::anyhow!(
-                                "Executable already exists at `{}`. Use `--reinstall` to force replacement.",
-                                to.user_display()
-                            ),
-                        ));
+                        );
+                        changelog.installed.insert(installation.key().clone());
+                    } else {
+                        if is_same_file(&to, &from).unwrap_or_default() {
+                            debug!(
+                                "Executable already exists at {} for {}",
+                                target.user_display(),
+                                installation.key(),
+                            );
+                        } else {
+                            errors.push((
+                                installation.key(),
+                                anyhow::anyhow!(
+                                    "Executable already exists at `{}`. Use `--reinstall` to replace.",
+                                    to.user_display()
+                                ),
+                            ));
+                        }
                     }
                 }
+                Err(err) => return Err(err.into()),
             }
-            Err(err) => return Err(err.into()),
         }
     }
 
@@ -367,35 +390,33 @@ pub(crate) async fn install(
         }
 
         for event in changelog.events() {
+            let executables = format_executables(&event, &changelog);
             match event.kind {
                 ChangeEventKind::Added => {
                     writeln!(
                         printer.stderr(),
-                        " {} {}{}",
+                        " {} {}{executables}",
                         "+".green(),
-                        event.key.bold(),
-                        format_installed_executables(&event.key, &changelog.installed_executables)
+                        event.key.bold()
                     )?;
                 }
                 ChangeEventKind::Removed => {
                     writeln!(
                         printer.stderr(),
-                        " {} {}{}",
+                        " {} {}{executables}",
                         "-".red(),
-                        event.key.bold(),
-                        format_installed_executables(&event.key, &changelog.installed_executables)
+                        event.key.bold()
                     )?;
                 }
                 ChangeEventKind::Reinstalled => {
                     writeln!(
                         printer.stderr(),
-                        " {} {}{}",
+                        " {} {}{executables}",
                         "~".yellow(),
                         event.key.bold(),
-                        format_installed_executables(&event.key, &changelog.installed_executables)
                     )?;
                 }
-            }
+            };
         }
 
         if preview.is_enabled() {
@@ -433,22 +454,19 @@ pub(crate) async fn install(
     Ok(ExitStatus::Success)
 }
 
-// TODO(zanieb): Change the formatting of this to something nicer, probably integrate with
-// `Changelog` and `ChangeEventKind`.
-fn format_installed_executables(
-    key: &PythonInstallationKey,
-    installed_executables: &FxHashMap<PythonInstallationKey, Vec<PathBuf>>,
-) -> String {
-    if let Some(executables) = installed_executables.get(key) {
-        let executables = executables
-            .iter()
-            .filter_map(|path| path.file_name())
-            .map(|name| name.to_string_lossy())
-            .join(", ");
-        format!(" ({executables})")
-    } else {
-        String::new()
-    }
+fn format_executables(event: &ChangeEvent, changelog: &Changelog) -> String {
+    let Some(installed) = changelog.installed_executables.get(&event.key) else {
+        return String::new();
+    };
+
+    let names = installed
+        .iter()
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy())
+        .sorted_unstable()
+        .join(", ");
+
+    format!(" ({names})")
 }
 
 fn warn_if_not_on_path(bin: &Path) {
